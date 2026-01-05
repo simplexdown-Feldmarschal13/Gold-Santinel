@@ -11,6 +11,7 @@ from app.decision.trust import (
     format_refusal,
     record_telemetry,
 )
+from app.decision.ecl import build_dec, emit_audit_trace, enforce_mof, render_dec, render_rrm
 from app.schemas import (
     Bias,
     Conflict,
@@ -75,6 +76,25 @@ def decide_v1(vision: VisionBundle) -> Decision:
             features=features,
             safety=Safety(refusal_reasons=[format_refusal("PLOT_PANE_NOT_FOUND")], conflicts=[]),
         )
+        # STEP 7 (ECL v1): audit trace (internal only).
+        dec = build_dec(decision.status, decision.bias, decision.safety)
+        decision_reasoning = enforce_mof([*decision.reasoning, *render_dec(dec), *render_rrm(decision.status, decision.safety)])
+        decision = Decision(
+            status=decision.status,
+            bias=decision.bias,
+            confidence=decision.confidence,
+            reasoning=decision_reasoning,
+            features=decision.features,
+            safety=decision.safety,
+        )
+        emit_audit_trace(
+            status=decision.status,
+            bias=decision.bias,
+            confidence=decision.confidence,
+            features=decision.features,
+            safety=decision.safety,
+            reasoning=decision.reasoning,
+        )
         record_telemetry(decision.status)
         return decision
 
@@ -116,6 +136,25 @@ def decide_v1(vision: VisionBundle) -> Decision:
             reasoning=expanded_reasoning,
             features=features,
             safety=Safety(refusal_reasons=refusal_reasons, conflicts=[]),
+        )
+        # STEP 7 (ECL v1): audit trace (internal only).
+        dec = build_dec(decision.status, decision.bias, decision.safety)
+        decision_reasoning = enforce_mof([*decision.reasoning, *render_dec(dec), *render_rrm(decision.status, decision.safety)])
+        decision = Decision(
+            status=decision.status,
+            bias=decision.bias,
+            confidence=decision.confidence,
+            reasoning=decision_reasoning,
+            features=decision.features,
+            safety=decision.safety,
+        )
+        emit_audit_trace(
+            status=decision.status,
+            bias=decision.bias,
+            confidence=decision.confidence,
+            features=decision.features,
+            safety=decision.safety,
+            reasoning=decision.reasoning,
         )
         record_telemetry(decision.status)
         return decision
@@ -297,6 +336,25 @@ def decide_v1(vision: VisionBundle) -> Decision:
         features=features,
         safety=Safety(refusal_reasons=refusal_reasons, conflicts=conflicts),
     )
+    # STEP 7 (ECL v1): append DEC + RRM for NO_TRADE, audit trace (internal only).
+    dec = build_dec(decision.status, decision.bias, decision.safety)
+    decision_reasoning = enforce_mof([*decision.reasoning, *render_dec(dec), *render_rrm(decision.status, decision.safety)])
+    decision = Decision(
+        status=decision.status,
+        bias=decision.bias,
+        confidence=decision.confidence,
+        reasoning=decision_reasoning,
+        features=decision.features,
+        safety=decision.safety,
+    )
+    emit_audit_trace(
+        status=decision.status,
+        bias=decision.bias,
+        confidence=decision.confidence,
+        features=decision.features,
+        safety=decision.safety,
+        reasoning=decision.reasoning,
+    )
     record_telemetry(decision.status)
     return decision
 
@@ -474,6 +532,25 @@ def decide_mtf_v1(htf: VisionBundle, ltf: VisionBundle) -> Decision:
         reasoning=expanded_reasoning,
         features=features,
         safety=Safety(refusal_reasons=refusal_reasons, conflicts=all_conflicts),
+    )
+    # STEP 7 (ECL v1): append DEC + RRM for NO_TRADE, audit trace (internal only).
+    dec = build_dec(decision.status, decision.bias, decision.safety)
+    decision_reasoning = enforce_mof([*decision.reasoning, *render_dec(dec), *render_rrm(decision.status, decision.safety)])
+    decision = Decision(
+        status=decision.status,
+        bias=decision.bias,
+        confidence=decision.confidence,
+        reasoning=decision_reasoning,
+        features=decision.features,
+        safety=decision.safety,
+    )
+    emit_audit_trace(
+        status=decision.status,
+        bias=decision.bias,
+        confidence=decision.confidence,
+        features=decision.features,
+        safety=decision.safety,
+        reasoning=decision.reasoning,
     )
     record_telemetry(decision.status)
     return decision
