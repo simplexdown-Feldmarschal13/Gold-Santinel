@@ -1,0 +1,1 @@
+"""Gold Sentinel application package."""
