@@ -3,6 +3,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from app.config import settings
+from app.decision.trust import (
+    compute_dcs,
+    dcs_conflict_if_unstable,
+    ensure_refusal_quality,
+    enforce_guardrails,
+    format_refusal,
+    record_telemetry,
+)
 from app.schemas import (
     Bias,
     Conflict,
@@ -51,21 +59,24 @@ def decide_v1(vision: VisionBundle) -> Decision:
     - T_trade/T_dir gating
     """
     reasoning: list[str] = []
-    refusal: list[str] = []
+    refusal_patterns: list[str] = []
+    refusal_freeform: list[str] = []
     conflicts: list[Conflict] = []
 
     # ---- Mandatory INSUFFICIENT_DATA gates ----
     if vision.plot_bbox is None or vision.struct_primary is None:
-        refusal.append("Chart pane could not be isolated from the screenshot.")
+        refusal_patterns.append("PLOT_PANE_NOT_FOUND")
         features = _empty_features_failed()
-        return Decision(
+        decision = Decision(
             status=DecisionStatus.insufficient_data,
             bias=Bias.neutral,
             confidence=0,
-            reasoning=["INSUFFICIENT DATA: " + refusal[0], "Action: upload a full chart pane with clear candles."],
+            reasoning=["INSUFFICIENT DATA: chart pane could not be isolated."],
             features=features,
-            safety=Safety(refusal_reasons=refusal, conflicts=[]),
+            safety=Safety(refusal_reasons=[format_refusal("PLOT_PANE_NOT_FOUND")], conflicts=[]),
         )
+        record_telemetry(decision.status)
+        return decision
 
     s = vision.struct_primary
     diag = s.diagnostics or {}
@@ -76,25 +87,38 @@ def decide_v1(vision: VisionBundle) -> Decision:
 
     # Partial chart / insufficient signal gates (spec: partial charts, low signal, cannot compute trend proxy)
     if vision.plot_quality < 0.20:
-        refusal.append("Chart pane quality is too low (low visibility or heavy obstruction).")
+        refusal_patterns.append("PLOT_QUALITY_BELOW_THRESHOLD")
     if edge_density < 0.01:
-        refusal.append("Insufficient visual signal (edge density too low).")
+        refusal_patterns.append("LOW_VISUAL_SIGNAL")
     if trace_points < 40:
-        refusal.append("Trend proxy cannot be computed reliably (insufficient trace points).")
+        refusal_patterns.append("INSUFFICIENT_TRACE_POINTS")
     if trace_x_span_ratio < 0.50:
-        refusal.append("Partial chart detected (insufficient horizontal span to infer structure).")
+        refusal_patterns.append("INSUFFICIENT_TRACE_SPAN")
 
-    if refusal:
+    if refusal_patterns:
         features = _features_from_vision(vision, bias=Bias.neutral, confidence=0, conflicts=[])
-        return Decision(
+        refusal_reasons, expanded_reasoning, _ = ensure_refusal_quality(
+            status=DecisionStatus.insufficient_data,
+            refusal_patterns=refusal_patterns,
+            existing_refusals=[],
+            reasoning=["INSUFFICIENT DATA: screenshot evidence is insufficient for reliable analysis."],
+        )
+        expanded_reasoning = enforce_guardrails(
+            reasoning=expanded_reasoning,
+            fit_quality=fit_quality,
+            plot_quality=float(min(1.0, max(0.0, vision.plot_quality))),
+            confidence=0,
+        )
+        decision = Decision(
             status=DecisionStatus.insufficient_data,
             bias=Bias.neutral,
             confidence=min(25, _clamp_int(10 + 200 * edge_density, 0, 25)),
-            reasoning=["INSUFFICIENT DATA: " + refusal[0]]
-            + (["Action: upload a higher-resolution, full-width chart pane with minimal overlays."] if len(refusal) else []),
+            reasoning=expanded_reasoning,
             features=features,
-            safety=Safety(refusal_reasons=refusal, conflicts=[]),
+            safety=Safety(refusal_reasons=refusal_reasons, conflicts=[]),
         )
+        record_telemetry(decision.status)
+        return decision
 
     # ---- Trend proxy interpretation ----
     # Note: image y axis increases downward; negative slope corresponds to rising price.
@@ -221,24 +245,60 @@ def decide_v1(vision: VisionBundle) -> Decision:
         reasoning.append(f"TRADE: confidence {confidence}% meets threshold (T_trade={settings.t_trade}).")
     else:
         reasoning.append(f"NO TRADE: confidence {confidence}% below threshold or blocked by safety gates.")
-        refusal.extend(trade_blockers)
-        if not refusal:
-            refusal.append(f"Confidence {confidence}% below trade threshold (T_trade={settings.t_trade}).")
+        # Standardized refusal patterns for NO_TRADE
+        if any("Plot isolation quality" in b for b in trade_blockers) or vision.plot_quality < 0.60:
+            refusal_patterns.append("PLOT_QUALITY_BELOW_THRESHOLD")
+        if fit_quality < 0.35:
+            refusal_patterns.append("TREND_FIT_UNSTABLE")
+        if not vision.direction_stable:
+            refusal_patterns.append("DIRECTION_UNSTABLE")
+        if any(c.severity == "high" for c in conflicts):
+            refusal_patterns.append("EVIDENCE_CONFLICT_CORE")
+        if confidence < settings.t_trade:
+            refusal_patterns.append("CONFIDENCE_BELOW_TRADE_THRESHOLD")
 
     # Final safety invariants (spec)
     if status == DecisionStatus.insufficient_data:
         bias = Bias.neutral
         confidence = min(confidence, 25)
 
+    # DCS (Decision Consistency Score): if unstable, downgrade confidence and emit a conflict.
+    dcs = compute_dcs(vision.direction_stable, vision.phase_stable)
+    dcs_conflict = dcs_conflict_if_unstable(vision.direction_stable, vision.phase_stable)
+    if dcs_conflict:
+        conflicts.append(dcs_conflict)
+        # Downgrade confidence deterministically (never increases): cap by DCS-weighted ceiling.
+        confidence = min(confidence, _clamp_int(float(confidence) * dcs, 0, 100))
+        if status == DecisionStatus.trade and confidence < settings.t_trade:
+            status = DecisionStatus.no_trade
+            refusal_patterns.append("DIRECTION_UNSTABLE" if not vision.direction_stable else "TREND_FIT_UNSTABLE")
+
     features = _features_from_vision(vision, bias=bias, confidence=confidence, conflicts=conflicts)
-    return Decision(
+
+    # Trust layer: standardized refusals + RQI-driven reasoning expansion + guardrails
+    refusal_reasons, expanded_reasoning, _ = ensure_refusal_quality(
+        status=status,
+        refusal_patterns=refusal_patterns,
+        existing_refusals=refusal_freeform,
+        reasoning=reasoning,
+    )
+    expanded_reasoning = enforce_guardrails(
+        reasoning=expanded_reasoning,
+        fit_quality=float(features.trend_proxy.fit_quality),
+        plot_quality=_extract_plot_quality(features.detectors.structure.notes),
+        confidence=confidence,
+    )
+
+    decision = Decision(
         status=status,
         bias=bias,
         confidence=confidence,
-        reasoning=reasoning,
+        reasoning=expanded_reasoning,
         features=features,
-        safety=Safety(refusal_reasons=refusal, conflicts=conflicts),
+        safety=Safety(refusal_reasons=refusal_reasons, conflicts=conflicts),
     )
+    record_telemetry(decision.status)
+    return decision
 
 
 def decide_mtf_v1(htf: VisionBundle, ltf: VisionBundle) -> Decision:
@@ -259,7 +319,7 @@ def decide_mtf_v1(htf: VisionBundle, ltf: VisionBundle) -> Decision:
 
     carried_conflicts = [*h.safety.conflicts, *l.safety.conflicts]
     mtf_conflicts: list[Conflict] = []
-    refusal_reasons: list[str] = []
+    refusal_patterns: list[str] = []
     reasoning: list[str] = []
 
     # ---- Directional Alignment Gate (HTF > LTF) ----
@@ -273,6 +333,7 @@ def decide_mtf_v1(htf: VisionBundle, ltf: VisionBundle) -> Decision:
                 evidence=["HTF bias is NEUTRAL → confidence −10."],
             )
         )
+        refusal_patterns.append("HTF_NEUTRAL")
 
     direction_conflict = (h.bias == Bias.bullish and l.bias == Bias.bearish) or (
         h.bias == Bias.bearish and l.bias == Bias.bullish
@@ -285,6 +346,7 @@ def decide_mtf_v1(htf: VisionBundle, ltf: VisionBundle) -> Decision:
                 evidence=[f"HTF={h.bias.value}, LTF={l.bias.value}."],
             )
         )
+        refusal_patterns.append("HTF_LTF_DIRECTION_CONFLICT")
 
     # ---- Market Phase Compatibility ----
     h_phase = h.features.market_phase
@@ -336,21 +398,21 @@ def decide_mtf_v1(htf: VisionBundle, ltf: VisionBundle) -> Decision:
 
     if direction_conflict:
         status = DecisionStatus.no_trade
-        refusal_reasons.append("HTF/LTF directional conflict detected.")
+        refusal_patterns.append("HTF_LTF_DIRECTION_CONFLICT")
     elif h.status == DecisionStatus.insufficient_data or l.status == DecisionStatus.insufficient_data:
         status = DecisionStatus.insufficient_data
-        refusal_reasons.append("One or more timeframes returned INSUFFICIENT_DATA.")
+        refusal_patterns.append("PLOT_QUALITY_BELOW_THRESHOLD")
     elif h.status != DecisionStatus.trade or l.status != DecisionStatus.trade:
         status = DecisionStatus.no_trade
-        refusal_reasons.append("One or more timeframes not trade-eligible under v1 safety gates.")
+        refusal_patterns.append("MTF_SAFETY_GATE")
     elif high_conflict_present:
         status = DecisionStatus.no_trade
-        refusal_reasons.append("High-severity conflict present.")
+        refusal_patterns.append("EVIDENCE_CONFLICT_CORE")
     elif confidence >= settings.t_trade:
         status = DecisionStatus.trade
     else:
         status = DecisionStatus.no_trade
-        refusal_reasons.append(f"Confidence {confidence}% below trade threshold (T_trade={settings.t_trade}).")
+        refusal_patterns.append("CONFIDENCE_BELOW_TRADE_THRESHOLD")
 
     # Directional gate preserved (T_dir): below this, bias forced neutral.
     bias = l.bias if confidence >= settings.t_dir else Bias.neutral
@@ -359,10 +421,12 @@ def decide_mtf_v1(htf: VisionBundle, ltf: VisionBundle) -> Decision:
     reasoning.append("MTF mode enabled: combining HTF context with LTF execution readiness.")
     reasoning.append(f"HTF bias: {h.bias.value}.")
     reasoning.append(f"LTF bias: {l.bias.value}.")
-    if h.bias == Bias.bullish:
-        reasoning.append("HTF bullish structure intact")
-    elif h.bias == Bias.bearish:
-        reasoning.append("HTF bearish structure intact")
+    # Anti-hallucination: avoid strong directional phrasing when HTF fit quality is weak.
+    if float(h.features.trend_proxy.fit_quality) >= 0.35:
+        if h.bias == Bias.bullish:
+            reasoning.append("HTF bullish structure intact")
+        elif h.bias == Bias.bearish:
+            reasoning.append("HTF bearish structure intact")
 
     if direction_conflict:
         reasoning.append("HTF/LTF directional conflict detected — trade refused")
@@ -389,18 +453,41 @@ def decide_mtf_v1(htf: VisionBundle, ltf: VisionBundle) -> Decision:
     reasoning.append(f"Final confidence: {confidence}%.")
     reasoning.append(f"Final status: {status.value}.")
 
-    # Safety: if not TRADE, refusal reasons must be present.
-    if status != DecisionStatus.trade and not refusal_reasons:
-        refusal_reasons = ["MTF safety gate triggered."]
+    # Trust layer: standardized refusals + RQI-driven reasoning expansion + guardrails
+    refusal_reasons, expanded_reasoning, _ = ensure_refusal_quality(
+        status=status,
+        refusal_patterns=refusal_patterns,
+        existing_refusals=[],
+        reasoning=reasoning,
+    )
+    expanded_reasoning = enforce_guardrails(
+        reasoning=expanded_reasoning,
+        fit_quality=float(features.trend_proxy.fit_quality),
+        plot_quality=_extract_plot_quality(features.detectors.structure.notes),
+        confidence=confidence,
+    )
 
-    return Decision(
+    decision = Decision(
         status=status,
         bias=bias,
         confidence=confidence,
-        reasoning=reasoning,
+        reasoning=expanded_reasoning,
         features=features,
         safety=Safety(refusal_reasons=refusal_reasons, conflicts=all_conflicts),
     )
+    record_telemetry(decision.status)
+    return decision
+
+
+def _extract_plot_quality(notes: list[str]) -> float:
+    # Extracts plot_quality from detector notes (deterministic, best-effort).
+    for n in notes:
+        if n.startswith("plot_quality="):
+            try:
+                return float(n.split("=", 1)[1])
+            except Exception:
+                return 0.0
+    return 0.0
 
 
 def _features_from_vision(vision: VisionBundle, bias: Bias, confidence: int, conflicts: list[Conflict]) -> Features:

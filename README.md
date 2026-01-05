@@ -48,3 +48,11 @@ Open:
 
 Gold Sentinel is a decision-support system. If the screenshot does not provide sufficient evidence, the system returns
 **INSUFFICIENT DATA** or **NO TRADE** by design.
+
+## Trust Layer (GTL v1): Why we refuse
+
+Gold Sentinel treats refusals as **high-quality outcomes**.
+
+- **Standardized refusal patterns**: every refusal includes a controlled pattern code (e.g. `PLOT_QUALITY_BELOW_THRESHOLD`, `INSUFFICIENT_TRACE_SPAN`, `HTF_LTF_DIRECTION_CONFLICT`) plus a concrete **Action**.
+- **Anti-hallucination guardrails**: when evidence quality is weak (e.g. `fit_quality < 0.35`), the system mechanically suppresses strong directional language.
+- **Consistency checks**: instability across deterministic preprocessing variants is surfaced as an explicit conflict and can only reduce confidence (never increase it).
