@@ -1,17 +1,18 @@
 from __future__ import annotations
 
+import json
+from uuid import uuid4
+
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import HTMLResponse
-from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.requests import Request
 
 from app.config import settings
-from app.decision.engine import decide, from_structure
-from app.schemas import AnalysisResponse, DecisionStatus
+from app.decision.engine import decide_v1
+from app.schemas import AnalysisResponse, ClientContext, VersionInfo
 from app.vision.image_io import load_image_bytes
-from app.vision.plot_region import estimate_plot_bbox
-from app.vision.structure import analyze_structure
+from app.vision.extract import extract_vision
 
 app = FastAPI(title=settings.app_name)
 
@@ -28,8 +29,12 @@ def application(request: Request):
     return templates.TemplateResponse("app.html", {"request": request, "title": "Application • Gold Sentinel"})
 
 
-@app.post("/api/analyze", response_model=AnalysisResponse)
-async def analyze(file: UploadFile = File(...), timeframe_hint: str | None = Form(default=None)):
+@app.post("/api/v1/analyze", response_model=AnalysisResponse)
+async def analyze_v1(
+    file: UploadFile = File(...),
+    timeframe_hint: str | None = Form(default=None),
+    client_context: str | None = Form(default=None),
+):
     if file.content_type is None or not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="Unsupported upload. Provide an image file.")
 
@@ -39,33 +44,35 @@ async def analyze(file: UploadFile = File(...), timeframe_hint: str | None = For
 
     bgr = load_image_bytes(data)
 
-    plot_bbox = estimate_plot_bbox(gray=_to_gray_for_bbox(bgr))
-    struct = analyze_structure(bgr=bgr, plot_bbox=plot_bbox)
-    features = from_structure(struct, timeframe=timeframe_hint)
+    # client_context is accepted per contract; parsed for validation only (no persistence in v1).
+    if client_context:
+        try:
+            ClientContext.model_validate(json.loads(client_context))
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid client_context JSON.")
 
-    decision = decide(features)
+    vision = extract_vision(bgr=bgr)
+    decision = decide_v1(vision)
 
-    # Safety: never claim TRADE when we explicitly lack data.
-    if decision.status == DecisionStatus.trade and decision.features.slope is None:
-        decision = decision.__class__(
-            bias=decision.bias,
-            confidence=min(decision.confidence, 40),
-            status=DecisionStatus.no_trade,
-            reasoning=decision.reasoning + ["Safety override: insufficient structural evidence for trade-eligible output."],
-            features=decision.features,
-        )
+    # Timeframe response per spec: v1 supports hint or unknown (OCR reserved for future hardening).
+    if timeframe_hint:
+        tf_detected = timeframe_hint
+        tf_conf = 1.0
+        tf_source = "hint"
+    else:
+        tf_detected = "unknown"
+        tf_conf = 0.0
+        tf_source = "unknown"
 
     return AnalysisResponse(
+        analysis_id=str(uuid4()),
+        timeframe={"detected": tf_detected, "confidence": tf_conf, "source": tf_source},
+        status=decision.status,
         bias=decision.bias,
         confidence=decision.confidence,
-        status=decision.status,
         reasoning=decision.reasoning,
         features=decision.features,
+        safety=decision.safety,
+        version=VersionInfo(vision_model=settings.vision_model, decision_model=settings.decision_model),
     )
-
-
-def _to_gray_for_bbox(bgr):
-    import cv2
-
-    return cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
 

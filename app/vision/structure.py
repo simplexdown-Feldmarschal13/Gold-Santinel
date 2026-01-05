@@ -126,6 +126,9 @@ def analyze_structure(bgr: np.ndarray, plot_bbox: tuple[int, int, int, int] | No
         "plot_bbox": plot_bbox,
         "edge_density": float(np.mean(edge > 0)),
         "trace_points": int(len(xs)),
+        "trace_x_span_ratio": 0.0
+        if len(xs) < 2
+        else float((max(xs) - min(xs)) / max(1.0, float(edge.shape[1] - 1))),
         "r2": None if r2 is None else float(r2),
     }
 

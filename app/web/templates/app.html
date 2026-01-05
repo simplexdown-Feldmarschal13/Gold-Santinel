@@ -50,7 +50,9 @@
 
     function render(result) {
       const lines = [];
+      lines.push(`Analysis: ${result.analysis_id}`);
       lines.push(`Instrument: ${result.instrument}`);
+      lines.push(`Timeframe: ${result.timeframe.detected} (${Math.round((result.timeframe.confidence || 0) * 100)}% via ${result.timeframe.source})`);
       lines.push(`Status: ${result.status}`);
       lines.push(`Bias: ${result.bias.toUpperCase()}`);
       lines.push(`Confidence: ${result.confidence}%`);
@@ -59,11 +61,16 @@
       for (const r of result.reasoning || []) lines.push(`- ${r}`);
       lines.push('');
       lines.push('Features:');
-      lines.push(`- Timeframe: ${result.features.timeframe ?? 'unknown'}`);
-      lines.push(`- Phase: ${result.features.phase}`);
-      lines.push(`- Slope: ${result.features.slope ?? 'n/a'}`);
+      lines.push(`- Market phase: ${result.features.market_phase}`);
+      lines.push(`- Trend direction: ${result.features.trend_proxy.direction}`);
+      lines.push(`- Trend strength: ${result.features.trend_proxy.strength}`);
+      lines.push(`- Fit quality: ${result.features.trend_proxy.fit_quality}`);
       lines.push(`- Levels: ${result.features.key_levels.length}`);
-      lines.push(`- Liquidity clusters: ${result.features.liquidity_pools.length}`);
+      lines.push(`- Liquidity pools: ${result.features.liquidity_pools.length}`);
+      lines.push('');
+      lines.push('Safety:');
+      for (const rr of result.safety.refusal_reasons || []) lines.push(`- Refusal: ${rr}`);
+      for (const c of result.safety.conflicts || []) lines.push(`- Conflict (${c.severity}): ${c.name}`);
       outputEl.textContent = lines.join('\n');
     }
 
@@ -78,7 +85,7 @@
       if (tf) fd.append('timeframe_hint', tf);
 
       try {
-        const res = await fetch('/api/analyze', { method: 'POST', body: fd });
+        const res = await fetch('/api/v1/analyze', { method: 'POST', body: fd });
         const json = await res.json();
         if (!res.ok) {
           statusEl.textContent = 'Analysis failed.';

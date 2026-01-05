@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any, Literal
+from typing import Literal
 
 from pydantic import BaseModel, Field
+
+# ---- Enums (v1 spec) ----
 
 
 class Bias(str, Enum):
@@ -18,40 +20,107 @@ class DecisionStatus(str, Enum):
     insufficient_data = "INSUFFICIENT_DATA"
 
 
+Timeframe = Literal["MN1", "W1", "D1", "H4", "H1", "M15", "M5", "unknown"]
+TimeframeSource = Literal["ocr", "hint", "unknown"]
+MarketPhase = Literal["expansion", "retracement", "consolidation", "unknown"]
+TrendDirection = Literal["up", "down", "flat", "unknown"]
+DetectorStatus = Literal["ok", "weak", "failed"]
+LevelKind = Literal["support", "resistance", "unknown"]
+LiquiditySide = Literal["buy_side", "sell_side", "unknown"]
+ConflictSeverity = Literal["low", "medium", "high"]
+
+
+# ---- Request contract (v1 spec) ----
+
+
+class ClientContext(BaseModel):
+    # Opaque audit/debug context; backend treats as optional metadata.
+    platform: str | None = None
+    broker: str | None = None
+    theme: str | None = None
+    resolution: str | None = None
+    notes: str | None = None
+
+
+# ---- Response contract (v1 spec) ----
+
+
+class TimeframeInfo(BaseModel):
+    detected: Timeframe
+    confidence: float = Field(..., ge=0.0, le=1.0)
+    source: TimeframeSource
+
+
+class PlotBBox(BaseModel):
+    x: int
+    y: int
+    w: int
+    h: int
+
+
+class TrendProxy(BaseModel):
+    direction: TrendDirection
+    strength: float = Field(..., ge=0.0, le=1.0)
+    fit_quality: float = Field(..., ge=0.0, le=1.0)
+
+
 class KeyLevel(BaseModel):
-    y_px: int = Field(..., description="Horizontal level in image pixel coordinates (top=0).")
-    strength: int = Field(..., ge=1, le=5, description="Relative strength 1-5.")
-    kind: Literal["support", "resistance", "unknown"] = "unknown"
+    y_px: int
+    kind: LevelKind
+    strength: int = Field(..., ge=1, le=5)
 
 
 class LiquidityPool(BaseModel):
     y_px: int
-    count: int = Field(..., ge=2, description="How many swing touches cluster at this level.")
-    side: Literal["buy_side", "sell_side", "unknown"] = "unknown"
+    side: LiquiditySide
+    count: int = Field(..., ge=2)
 
 
-class VisionFeatures(BaseModel):
-    timeframe: str | None = None
-    plot_bbox: tuple[int, int, int, int] | None = None  # x, y, w, h
-    slope: float | None = None  # px per px (x->y)
-    slope_strength: float | None = None  # 0..1-ish
-    phase: Literal["expansion", "retracement", "consolidation", "unknown"] = "unknown"
+class DetectorInfo(BaseModel):
+    status: DetectorStatus
+    notes: list[str] = []
+
+
+class Detectors(BaseModel):
+    structure: DetectorInfo
+    levels: DetectorInfo
+    liquidity: DetectorInfo
+
+
+class Features(BaseModel):
+    plot_bbox: PlotBBox
+    market_phase: MarketPhase
+    trend_proxy: TrendProxy
     key_levels: list[KeyLevel] = []
     liquidity_pools: list[LiquidityPool] = []
-    diagnostics: dict[str, Any] = {}
+    detectors: Detectors
 
 
-class AnalysisRequest(BaseModel):
-    timeframe_hint: str | None = Field(
-        default=None,
-        description="Optional user-provided timeframe (e.g., D1/H4/H1/M15). Used when OCR is unreliable.",
-    )
+class Conflict(BaseModel):
+    name: str
+    severity: ConflictSeverity
+    evidence: list[str] = []
+
+
+class Safety(BaseModel):
+    refusal_reasons: list[str] = []
+    conflicts: list[Conflict] = []
+
+
+class VersionInfo(BaseModel):
+    api: Literal["v1"] = "v1"
+    vision_model: str
+    decision_model: str
 
 
 class AnalysisResponse(BaseModel):
+    analysis_id: str
     instrument: Literal["XAUUSD"] = "XAUUSD"
+    timeframe: TimeframeInfo
+    status: DecisionStatus
     bias: Bias
     confidence: int = Field(..., ge=0, le=100)
-    status: DecisionStatus
     reasoning: list[str]
-    features: VisionFeatures
+    features: Features
+    safety: Safety
+    version: VersionInfo
