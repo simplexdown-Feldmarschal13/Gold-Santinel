@@ -9,7 +9,7 @@ from fastapi.templating import Jinja2Templates
 from starlette.requests import Request
 
 from app.config import settings
-from app.decision.engine import decide_v1
+from app.decision.engine import decide_mtf_v1, decide_v1
 from app.schemas import AnalysisResponse, ClientContext, VersionInfo
 from app.vision.image_io import load_image_bytes
 from app.vision.extract import extract_vision
@@ -31,38 +31,67 @@ def application(request: Request):
 
 @app.post("/api/v1/analyze", response_model=AnalysisResponse)
 async def analyze_v1(
-    file: UploadFile = File(...),
+    file: list[UploadFile] = File(...),
     timeframe_hint: str | None = Form(default=None),
     client_context: str | None = Form(default=None),
 ):
-    if file.content_type is None or not file.content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail="Unsupported upload. Provide an image file.")
+    if not file:
+        raise HTTPException(status_code=400, detail="Missing file upload.")
 
-    data = await file.read()
-    if len(data) > settings.max_upload_mb * 1024 * 1024:
-        raise HTTPException(status_code=413, detail=f"File too large. Max {settings.max_upload_mb}MB.")
+    for f in file:
+        if f.content_type is None or not f.content_type.startswith("image/"):
+            raise HTTPException(status_code=400, detail="Unsupported upload. Provide an image file.")
 
-    bgr = load_image_bytes(data)
-
-    # client_context is accepted per contract; parsed for validation only (no persistence in v1).
+    # client_context is accepted per contract; parsed for validation + optional MTF mode (no persistence in v1).
+    ctx_raw: dict | None = None
     if client_context:
         try:
-            ClientContext.model_validate(json.loads(client_context))
+            ctx_raw = json.loads(client_context)
+            ClientContext.model_validate(ctx_raw)
         except Exception:
             raise HTTPException(status_code=400, detail="Invalid client_context JSON.")
 
-    vision = extract_vision(bgr=bgr)
-    decision = decide_v1(vision)
+    # ---- Single screenshot fallback (exact v1 behavior) ----
+    mtf_mode = bool(isinstance(ctx_raw, dict) and ctx_raw.get("mode") == "MTF")
+    if (not mtf_mode) or len(file) != 2:
+        data = await file[0].read()
+        if len(data) > settings.max_upload_mb * 1024 * 1024:
+            raise HTTPException(status_code=413, detail=f"File too large. Max {settings.max_upload_mb}MB.")
+        bgr = load_image_bytes(data)
+        vision = extract_vision(bgr=bgr)
+        decision = decide_v1(vision)
 
-    # Timeframe response per spec: v1 supports hint or unknown (OCR reserved for future hardening).
-    if timeframe_hint:
-        tf_detected = timeframe_hint
-        tf_conf = 1.0
-        tf_source = "hint"
+        # Timeframe response per spec: v1 supports hint or unknown (OCR reserved for future hardening).
+        if timeframe_hint:
+            tf_detected = timeframe_hint
+            tf_conf = 1.0
+            tf_source = "hint"
+        else:
+            tf_detected = "unknown"
+            tf_conf = 0.0
+            tf_source = "unknown"
     else:
-        tf_detected = "unknown"
-        tf_conf = 0.0
-        tf_source = "unknown"
+        # ---- MTF mode (two uploads, deterministic ordering) ----
+        # Deterministic mapping: file[0] = HTF, file[1] = LTF
+        data_htf = await file[0].read()
+        data_ltf = await file[1].read()
+        if len(data_htf) > settings.max_upload_mb * 1024 * 1024 or len(data_ltf) > settings.max_upload_mb * 1024 * 1024:
+            raise HTTPException(status_code=413, detail=f"File too large. Max {settings.max_upload_mb}MB.")
+
+        bgr_htf = load_image_bytes(data_htf)
+        bgr_ltf = load_image_bytes(data_ltf)
+
+        v_htf = extract_vision(bgr=bgr_htf)
+        v_ltf = extract_vision(bgr=bgr_ltf)
+        decision = decide_mtf_v1(v_htf, v_ltf)
+
+        # Timeframe in response remains single (v1 contract): use LTF hint if supplied.
+        ltf_hint = None
+        if isinstance(ctx_raw, dict):
+            ltf_hint = (ctx_raw.get("ltf") or {}).get("timeframe_hint")
+        tf_detected = ltf_hint or timeframe_hint or "unknown"
+        tf_conf = 1.0 if tf_detected != "unknown" else 0.0
+        tf_source = "hint" if tf_detected != "unknown" else "unknown"
 
     return AnalysisResponse(
         analysis_id=str(uuid4()),

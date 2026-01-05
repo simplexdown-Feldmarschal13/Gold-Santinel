@@ -241,6 +241,168 @@ def decide_v1(vision: VisionBundle) -> Decision:
     )
 
 
+def decide_mtf_v1(htf: VisionBundle, ltf: VisionBundle) -> Decision:
+    """
+    Multi-Timeframe Confluence Engine (MTF v1).
+
+    Constraints (as per instruction prompt):
+    - Deterministic only
+    - No schema changes
+    - Reuse existing vision outputs and v1 decision
+    - Prefer NO_TRADE over false certainty
+    """
+    h = decide_v1(htf)
+    l = decide_v1(ltf)
+
+    # Output remains spec-shaped: we return LTF features as the execution context.
+    features = l.features
+
+    carried_conflicts = [*h.safety.conflicts, *l.safety.conflicts]
+    mtf_conflicts: list[Conflict] = []
+    refusal_reasons: list[str] = []
+    reasoning: list[str] = []
+
+    # ---- Directional Alignment Gate (HTF > LTF) ----
+    direction_adjust = 0
+    if h.bias == Bias.neutral:
+        direction_adjust -= 10
+        mtf_conflicts.append(
+            Conflict(
+                name="htf_neutral",
+                severity="low",
+                evidence=["HTF bias is NEUTRAL → confidence −10."],
+            )
+        )
+
+    direction_conflict = (h.bias == Bias.bullish and l.bias == Bias.bearish) or (
+        h.bias == Bias.bearish and l.bias == Bias.bullish
+    )
+    if direction_conflict:
+        mtf_conflicts.append(
+            Conflict(
+                name="htf_ltf_direction_conflict",
+                severity="high",
+                evidence=[f"HTF={h.bias.value}, LTF={l.bias.value}."],
+            )
+        )
+
+    # ---- Market Phase Compatibility ----
+    h_phase = h.features.market_phase
+    l_phase = l.features.market_phase
+
+    phase_adjust = 0
+    if h_phase == "expansion" and l_phase == "retracement":
+        phase_adjust = 5
+    elif h_phase == "expansion" and l_phase == "expansion":
+        phase_adjust = -8
+        mtf_conflicts.append(
+            Conflict(
+                name="phase_late_move_risk",
+                severity="medium",
+                evidence=["HTF expansion + LTF expansion → confidence −8 (late move risk)."],
+            )
+        )
+    elif h_phase == "consolidation" and l_phase == "expansion":
+        phase_adjust = -12
+        mtf_conflicts.append(
+            Conflict(
+                name="phase_fake_breakout_risk",
+                severity="medium",
+                evidence=["HTF consolidation + LTF expansion → confidence −12 (fake breakout risk)."],
+            )
+        )
+
+    # ---- Confidence Composition (Extend v1) ----
+    # C_total = C_v1 + C_HTF_bonus + C_LTF_bonus − C_MTF_penalties
+    # v1 MTF implementation:
+    # - C_v1 = C_ltf
+    # - C_HTF_bonus = round(2*(C_htf - C_ltf)/3)  (HTF weighs 2× LTF)
+    # - C_LTF_bonus = 0
+    # - C_MTF_penalties/bonuses are the explicit rule-table adjustments (direction_adjust, phase_adjust)
+    c_ltf = int(l.confidence)
+    c_htf = int(h.confidence)
+    c_htf_bonus = _clamp_int(2.0 * (float(c_htf) - float(c_ltf)) / 3.0, -100, 100)
+
+    confidence = _clamp_int(float(c_ltf + c_htf_bonus + direction_adjust + phase_adjust), 0, 100)
+
+    # Any HTF conflict caps confidence at ≤55 (v1 MTF rule).
+    # Interpreted as: any HIGH MTF directional conflict or any HIGH conflict already present in HTF decision.
+    if direction_conflict or any(c.severity == "high" for c in h.safety.conflicts):
+        confidence = min(confidence, 55)
+
+    # ---- Status gating ----
+    all_conflicts = [*carried_conflicts, *mtf_conflicts]
+    high_conflict_present = any(c.severity == "high" for c in all_conflicts)
+
+    if direction_conflict:
+        status = DecisionStatus.no_trade
+        refusal_reasons.append("HTF/LTF directional conflict detected.")
+    elif h.status == DecisionStatus.insufficient_data or l.status == DecisionStatus.insufficient_data:
+        status = DecisionStatus.insufficient_data
+        refusal_reasons.append("One or more timeframes returned INSUFFICIENT_DATA.")
+    elif h.status != DecisionStatus.trade or l.status != DecisionStatus.trade:
+        status = DecisionStatus.no_trade
+        refusal_reasons.append("One or more timeframes not trade-eligible under v1 safety gates.")
+    elif high_conflict_present:
+        status = DecisionStatus.no_trade
+        refusal_reasons.append("High-severity conflict present.")
+    elif confidence >= settings.t_trade:
+        status = DecisionStatus.trade
+    else:
+        status = DecisionStatus.no_trade
+        refusal_reasons.append(f"Confidence {confidence}% below trade threshold (T_trade={settings.t_trade}).")
+
+    # Directional gate preserved (T_dir): below this, bias forced neutral.
+    bias = l.bias if confidence >= settings.t_dir else Bias.neutral
+
+    # ---- Reasoning (required, human-readable, auditable) ----
+    reasoning.append("MTF mode enabled: combining HTF context with LTF execution readiness.")
+    reasoning.append(f"HTF bias: {h.bias.value}.")
+    reasoning.append(f"LTF bias: {l.bias.value}.")
+    if h.bias == Bias.bullish:
+        reasoning.append("HTF bullish structure intact")
+    elif h.bias == Bias.bearish:
+        reasoning.append("HTF bearish structure intact")
+
+    if direction_conflict:
+        reasoning.append("HTF/LTF directional conflict detected — trade refused")
+
+    if h_phase and l_phase:
+        reasoning.append(f"HTF phase: {h_phase}.")
+        reasoning.append(f"LTF phase: {l_phase}.")
+
+    if h_phase == "expansion" and l_phase == "retracement" and not direction_conflict:
+        reasoning.append("LTF pullback aligns with HTF trend")
+
+    if h.bias == Bias.neutral:
+        reasoning.append("HTF neutral → confidence −10")
+    if phase_adjust == 5:
+        reasoning.append("HTF expansion + LTF retracement → +5 confidence")
+    elif phase_adjust == -8:
+        reasoning.append("HTF expansion + LTF expansion → −8 confidence (late move risk)")
+    elif phase_adjust == -12:
+        reasoning.append("HTF consolidation + LTF expansion → −12 confidence (fake breakout risk)")
+
+    reasoning.append(
+        f"Confidence composition: base(LTF)={c_ltf}%, HTF={c_htf}% (2× weight via bonus={c_htf_bonus}), direction_adj={direction_adjust}, phase_adj={phase_adjust}."
+    )
+    reasoning.append(f"Final confidence: {confidence}%.")
+    reasoning.append(f"Final status: {status.value}.")
+
+    # Safety: if not TRADE, refusal reasons must be present.
+    if status != DecisionStatus.trade and not refusal_reasons:
+        refusal_reasons = ["MTF safety gate triggered."]
+
+    return Decision(
+        status=status,
+        bias=bias,
+        confidence=confidence,
+        reasoning=reasoning,
+        features=features,
+        safety=Safety(refusal_reasons=refusal_reasons, conflicts=all_conflicts),
+    )
+
+
 def _features_from_vision(vision: VisionBundle, bias: Bias, confidence: int, conflicts: list[Conflict]) -> Features:
     # Build spec-shaped features. v1 keeps key level/liquidity classification conservative ("unknown").
     assert vision.plot_bbox is not None and vision.struct_primary is not None
